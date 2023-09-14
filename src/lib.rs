@@ -108,12 +108,42 @@ use std::borrow::Cow;
 
 use libsystemd::errors::SdError;
 use libsystemd::logging::Priority;
-use log::kv::{Error, Key, Value, Visitor};
+use log::kv::{Error as LogError, Key, Value, Visitor};
 use log::{Level, Log, Metadata, Record, SetLoggerError};
 use std::cmp::min;
+use std::fmt::Display;
 use std::io::ErrorKind;
 
 pub use libsystemd::logging::connected_to_journal;
+
+/// Base error type
+#[derive(Debug)]
+pub enum Error {
+    /// Handle error given by libsystemd
+    Journald(SdError),
+    /// Handle error given by log::kv
+    Log(LogError),
+}
+
+impl From<SdError> for Error {
+    fn from(err: SdError) -> Self {
+        Self::Journald(err)
+    }
+}
+
+impl From<LogError> for Error {
+    fn from(err: LogError) -> Self {
+        Self::Log(err)
+    }
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("Error {}", self))
+    }
+}
+
+impl std::error::Error for Error {}
 
 /// Convert a a log level to a journal priority.
 fn level_to_priority(level: Level) -> Priority {
@@ -194,18 +224,16 @@ pub fn journal_send<'a, K, V, I>(
     syslog_identifier: &str,
     record: &Record,
     extra_fields: I,
-) -> Result<(), SdError>
+) -> Result<(), Error>
 where
     I: Iterator<Item = &'a (K, V)>,
     K: AsRef<str> + 'a,
     V: AsRef<str> + 'a,
 {
     let mut record_fields = Vec::with_capacity(record.key_values().count());
-    // Our visitor never fails so we can safely unwrap here
     record
         .key_values()
-        .visit(&mut CollectKeyValues(&mut record_fields))
-        .unwrap();
+        .visit(&mut CollectKeyValues(&mut record_fields))?;
     let mut global_fields: Vec<(Cow<str>, Cow<str>)> =
         vec![("SYSLOG_PID".into(), std::process::id().to_string().into())];
     if !syslog_identifier.is_empty() {
@@ -223,13 +251,14 @@ where
                     .iter()
                     .map(|(k, v)| (escape_journal_key(k.as_ref()), format!("{}", v).into())),
             ),
-    )
+    )?;
+    Ok(())
 }
 
 struct CollectKeyValues<'a, 'kvs>(&'a mut Vec<(Key<'kvs>, Value<'kvs>)>);
 
 impl<'a, 'kvs> Visitor<'kvs> for CollectKeyValues<'a, 'kvs> {
-    fn visit_pair(&mut self, key: Key<'kvs>, value: Value<'kvs>) -> Result<(), Error> {
+    fn visit_pair(&mut self, key: Key<'kvs>, value: Value<'kvs>) -> Result<(), LogError> {
         self.0.push((key, value));
         Ok(())
     }
@@ -324,7 +353,7 @@ impl<K: AsRef<str>, V: AsRef<str>> JournalLog<K, V> {
     /// and append all `extra_fields`; the send the resulting fields to the
     /// systemd journal with [`libsystemd::logging::journal_send`] and return
     /// the result of that function.
-    pub fn journal_send(&self, record: &Record) -> Result<(), SdError> {
+    pub fn journal_send(&self, record: &Record) -> Result<(), Error> {
         journal_send(&self.syslog_identifier, record, self.extra_fields.iter())
     }
 }
@@ -380,13 +409,15 @@ where
     ///
     /// # Errors
     ///
-    /// **Panic** if sending the `record` to journald fails,
+    /// print a systemd error if sending the `record` to journald fails,
     /// i.e. if journald is not running.
     ///
     /// See [`JournalLog::journal_send`] for a function which returns any error which might have
     /// occurred while sending the `record` to the journal.
     fn log(&self, record: &Record) {
-        self.journal_send(record).unwrap();
+        if let Err(err) = self.journal_send(record) {
+            eprintln!("{}", err)
+        }
     }
 
     /// Flush log records.
